@@ -1,42 +1,39 @@
 // Project Dods Term - A terminal-based text editor written in C
 
-/* ==================== INCLUDES ============================================*/
-
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 
-/*==============================END SECTION===================================*/
-
-
-
+#define CTRL_KEY(k) ((k) & 0x1f) /* Define macro of pressing CTRL */
 
 
-/*==================================DATA======================================*/
+typedef struct editorConfig{
+	int screenrows, screencols;
+	struct termios orig_termios;
+}Editor; 	/* Declare a copy of editor config struct to preserve it for future use */
 
-struct termios orig_termios; /* Declare a copy of termios struct to preserve it for future use */
-
-/*==============================END SECTION===================================*/
-
-
-
-
-/*============================TERMINAL========================================*/
+Editor E; /* Declare instance of Editor as E */
 
 void die(const char* s){
 	/*======================================
 	Function to print error messages when
 	program encounters errors
 	======================================*/
+	write(STDOUT_FILENO, "\x1b[2J", 4);
+	write(STDOUT_FILENO, "\x1b[H", 3);
+
+	/* Clear screen on exit */
+
 	perror(s); /* stdio.h */
 	exit(1); /* stdlib.h */
 }
 
 void disableRawMode(){
-	if(tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1){
+	if(tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1){
 		die("tcsetattr");
 	}
 
@@ -51,13 +48,13 @@ void enableRawMode(){
 	/*=======================================
 	Function to turn off input echoing
 	=======================================*/
-	if(tcgetattr(STDIN_FILENO, &orig_termios) == -1){
+	if(tcgetattr(STDIN_FILENO, &E.orig_termios) == -1){
 		die("tcgetattr");
 	}
 	
 	atexit(disableRawMode); /* stdlib.h -> calls attributes when program ends */
 
-	struct termios raw = orig_termios; /* create termios struct raw and assign orig */
+	struct termios raw = E.orig_termios; /* create termios struct raw and assign orig */
 
 	/* Terminal Flags */
 	raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
@@ -123,27 +120,175 @@ void enableRawMode(){
 	}
 }
 
-/*=====================END SECTION===================================*/
+char editorKeyRead(){
+	/*=======================================
+	Function to refactor keyboard input
+	=======================================*/
+	int nread;
+	char c;
+	while((nread = read(STDIN_FILENO, &c, 1)) == -1){
+		if(nread == -1 && errno != EAGAIN) die("read");
+	}
+	return c;
+}
+
+void editorKeyress(){
+	/*=======================================
+	Main terminal editor window
+	=======================================*/
+	char c = editorKeyRead();
+
+	switch(c){
+		case CTRL_KEY('q'): {
+			write(STDOUT_FILENO, "\x1b[2J", 4);
+			write(STDOUT_FILENO, "\x1b[H", 3);
+			exit(0);
+			break;
+		}
+	}
+}
+
+int getCursorPosition(int *rows, int *cols){
+	/*=====================================
+	Function to get cursor position
+	======================================*/
+	char buf[32];
+	unsigned int i = 0;
+
+	if(write(STDOUT_FILENO, "\x1b[6n", 4) != 4){
+		return -1;
+	}
+
+	while(i < sizeof(buf) - 1){
+		if(read(STDIN_FILENO, &buf[i], 1) != 1) break;
+		if(buf[i] == 'R') break;
+		i++;
+	}
+	buf[i] = '\0';
+
+	if(buf[0] != '\x1b' || buf[1] != '[') return -1;
+	if(sscanf((&buf[2]), "%d;%d", rows, cols) != 2) return -1;
+
+	return 0;
 
 
+}
+
+int getWindowSize(int *rows, int *cols){
+	/*================================================
+	Get window size - ioctl() and fallback method
+	================================================*/
+	struct winsize ws;
+
+	if(1 || ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0){
+		if(write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12){
+			return -1;
+		}
+		return getCursorPosition(rows, cols);
+	} else {
+		*cols = ws.ws_col;
+		*rows = ws.ws_row;
+		return 0;
+	}
+	/*================================================
+	TICOCGWINSZ -> Terminal IOCtl (Input/Output Control
+	) Get WINdow SiZe
+
+	on success ioctl() will place columns wide and
+	number of rows as high the terminal is given into
+	given winsize struct
+
+	Fallback method 
+	-> position cursor at the bottom-right of the screen
+	then use escape sequences that query the position 
+	of the cursor that tells how many rows anc cols 
+	are on the screen
+	
+	C -> command to move cursor to the right
+	B -> command to move cursor down
+
+	Use largest values to ensure that the cursor
+	would be positioned at the bottom right [999C and [999B
+
+	C and B are specifically documented to stop cursor
+	from going past the  edge of the screen
+
+	Append 1 || at the beginning of 1st condition
+	to test if confition temporarilly
+
+	================================================*/
+}
+
+void initEditor(){
+	if(getWindowSize(&E.screenrows, &E.screencols) == -1){
+		die("getWindowSize");
+	}
+}
+
+void editorDrawRows(){
+	/*========================
+	Function to draw tildes
+	on the side of screen like
+	vim
+	========================*/
+	for(int r=0; r<E.screenrows; r++){ /* draw up to 25 rows for now */
+		write(STDOUT_FILENO, "~", 1);
+
+		if(r < E.screenrows - 1){
+			write(STDOUT_FILENO, "\r\n", 2);
+		}
+	}
+}
+
+void editorRefreshScreen(){
+	/*=======================================
+	Function to clear screen after each
+	keypress
+	=======================================*/
+	write(STDOUT_FILENO, "\x1b[2J", 4);
+	write(STDOUT_FILENO, "\x1b[H", 3);
+
+	/*======================================
+	write and STDOUT_FILENO -> unistd.h
+
+	we write 4 bytes out to the terminal
+	\x1b - 1st byte (escape char ; 27 dec)
+	[2J -> other 3 bytes
+
+	\x1b[2J -> escape sequence, always starts
+	with \x1b followed by [
+
+	J -> command byte to clear screen (erase on
+	display) - takes in arguments before the 
+	command
+	1J -> clear screen up to where cursor is
+	0J -> clear screen from cursor up to end
+	of screen
+
+	2J -> clear everything
+
+	###
+
+	\x1b[H -> 3 byte escape sequence, uses 
+	H (cursor position) command which takes
+	two arguments (row num, col num) which is.
+	the cursor's position
+
+	default values for args, 1
+	======================================*/
+
+	editorDrawRows();
+	write(STDOUT_FILENO, "\x1b[H", 3); /* Bring cursor to col 1 row 1 of terminal */
+}
 
 
-
-/*============================INIT===================================*/
 int main(){
 	enableRawMode(); /* While program is running, no input will be echoed */
-	
+	initEditor(); /* initialize the editor */
+
 	while(1){
-		char c = '\0';
-		if(read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN){
-			die("read");
-		}
-		if(iscntrl(c)){
-			printf("%d\r\n", c);
-		} else {
-			printf("%d ('%d')", c, c);
-		}
-		if(c == 'q') break;
+		editorRefreshScreen();
+		editorKeyress();
 	}
 	
 	// While able to read or input not q
@@ -161,4 +306,3 @@ int main(){
 	return 0;
 }
 
-/*=====================END SECTION===================================*/
